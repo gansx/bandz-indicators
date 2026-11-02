@@ -1,0 +1,154 @@
+name: Sync upstream (samuelharting/bandz-indicators)
+
+# 每周一自动跟上上游
+# 上游无 workflow，无冲突风险；仓库仅 392 KB，构建很快
+
+on:
+  schedule:
+    # 每周一 02:45 UTC = 北京时间 10:45（错开 czsc 02:00 / chanlun 02:30）
+    - cron: '45 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      sync_tags:
+        description: '同时同步上游 tag'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/samuelharting/bandz-indicators.git 2>/dev/null || true
+          git fetch upstream main --force
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            git fetch upstream --tags --force || true
+          fi
+
+      - name: Detect drift
+        id: drift
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/main)
+          echo "local  = $LOCAL"
+          echo "remote = $REMOTE"
+
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新"
+          else
+            BEHIND=$(git rev-list --count HEAD..upstream/main)
+            AHEAD=$(git rev-list --count upstream/main..HEAD)
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead_count=$AHEAD"  >> "$GITHUB_OUTPUT"
+            echo "上游有 $BEHIND 个新提交，本地领先 $AHEAD 个"
+          fi
+
+      - name: Merge upstream/main
+        id: merge
+        if: steps.drift.outputs.behind == 'true'
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "merge 成功"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            echo "merge 冲突，已回滚"
+          fi
+
+      - name: Push
+        if: steps.drift.outputs.behind == 'true' && steps.merge.outputs.result == 'ok'
+        run: |
+          git push origin main
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            git push origin --tags --force-with-lease || git push origin --tags || true
+          fi
+
+      - name: Report Pine source count
+        if: steps.merge.outputs.result == 'ok'
+        run: |
+          N=$(find indicators -name '*.pine' 2>/dev/null | wc -l)
+          L=$(find indicators -name '*.pine' -exec cat {} + 2>/dev/null | wc -l)
+          echo "Pine 脚本: $N 个 / $L 行"
+          echo "### Pine 脚本: $N 个 / $L 行" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `上游同步冲突 ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## 自动同步遇到冲突，已回滚',
+              '',
+              `上游 \`samuelharting/bandz-indicators\` 有 **${process.env.BEHIND}** 个新提交，merge 失败。`,
+              '',
+              '### 处理',
+              '```bash',
+              'git clone https://github.com/' + process.env.REPO + '.git',
+              'cd bandz-indicators',
+              'git remote add upstream https://github.com/samuelharting/bandz-indicators.git',
+              'git fetch upstream',
+              'git merge upstream/main',
+              'git push origin main',
+              '```',
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `再次冲突 @ ${new Date().toISOString()}`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body, labels: ['upstream-sync']
+            });
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind_count }}
+          REPO: ${{ github.repository }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游新提交 | ${{ steps.drift.outputs.behind_count || '0' }} |"
+            echo "| 本地领先 | ${{ steps.drift.outputs.ahead_count || '0' }} |"
+            echo "| merge | ${{ steps.merge.outputs.result || 'n/a' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
